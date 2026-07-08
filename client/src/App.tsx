@@ -3,24 +3,19 @@ import { SignalingClient } from "./webrtc/signaling";
 import { PeerManager } from "./webrtc/peerManager";
 import { YjsManager } from "./sync/yjsManager";
 import type { TableObjectData } from "./sync/yjsManager";
+import TableCanvas, { TableCanvasRef } from "./table/TableCanvas";
 
 /**
- * OakTable WebRTC Test Client with Yjs CRDT Sync
+ * OakTable — P2P Virtual Tabletop
  *
- * Test scenario:
- * 1. Open two browser tabs
- * 2. Tab 1: enter room="test", peer="A", click "Connect as Initiator"
- * 3. Tab 2: enter room="test", peer="B", click "Connect as Receiver"
- * 4. Tab 1 clicks "Add Object" -> Tab 2 sees it in the list (synced via Yjs CRDT)
- * 5. Tab 1 types in notes -> Tab 2 sees it in real-time (synced via Y.Text)
- * 6. Both tabs can chat via "chat" DataChannel
- *
- * Two DataChannels:
- *   - "chat"  — plain text chat messages
- *   - "yjs"   — Yjs CRDT binary/JSON updates
+ * Architecture:
+ * - Signaling server (WebSocket) for initial PeerConnection setup
+ * - WebRTC DataChannels: "chat" (text messages), "yjs" (CRDT sync)
+ * - PixiJS canvas for infinite 2D virtual table
+ * - Yjs CRDT for shared state synchronization
  */
-
 export default function App() {
+  // ─── Connection state ───
   const [roomId, setRoomId] = useState("test");
   const [peerId, setPeerId] = useState("");
   const [chatMessage, setChatMessage] = useState("");
@@ -30,19 +25,22 @@ export default function App() {
   const [yjsChannelState, setYjsChannelState] = useState<string>("N/A");
   const [isConnected, setIsConnected] = useState(false);
   const [yjsInitialized, setYjsInitialized] = useState(false);
+  const [activeYjsManager, setActiveYjsManager] = useState<YjsManager | undefined>(undefined);
 
-  // Yjs CRDT state
+  // ─── Yjs CRDT state ───
   const [objectCount, setObjectCount] = useState(0);
   const [objectList, setObjectList] = useState<Map<string, TableObjectData>>(new Map());
   const [notesText, setNotesText] = useState("");
 
+  // ─── Refs ───
   const signalingRef = useRef<SignalingClient | null>(null);
   const peerRef = useRef<PeerManager | null>(null);
   const yjsRef = useRef<YjsManager | null>(null);
   const checkDcIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const yjsConnectedRef = useRef(false);
+  const tableCanvasRef = useRef<TableCanvasRef | null>(null);
 
-  // Clean up WebRTC resources on unmount
+  // ─── Cleanup on unmount ───
   useEffect(() => {
     return () => {
       yjsRef.current?.close();
@@ -54,21 +52,18 @@ export default function App() {
     };
   }, []);
 
-  // Sync object list from Yjs state
+  // ─── Yjs sync helpers ───
   const syncObjectList = useCallback((yjs: YjsManager) => {
     const objects = yjs.getAllObjects();
     setObjectList(new Map(objects));
     setObjectCount(yjs.getObjectCount());
   }, []);
 
-  // Sync notes from Yjs state
   const syncNotes = useCallback((yjs: YjsManager) => {
     setNotesText(yjs.getNotesText());
   }, []);
 
-  /**
-   * Connect to signaling server, then initialize PeerManager and YjsManager.
-   */
+  // ─── Connection handler ───
   const handleConnect = async (isInitiator: boolean): Promise<void> => {
     if (!peerId.trim()) {
       alert("Please enter a Peer ID");
@@ -83,7 +78,7 @@ export default function App() {
     setIsConnected(false);
     yjsConnectedRef.current = false;
 
-    // Clean up previous connections
+    // Clean up previous
     yjsRef.current?.close();
     peerRef.current?.close();
     signalingRef.current?.disconnect();
@@ -91,13 +86,11 @@ export default function App() {
       clearInterval(checkDcIntervalRef.current);
     }
 
-    // Create signaling client
+    // Signaling
     const signaling = new SignalingClient("ws://localhost:8000");
     signalingRef.current = signaling;
-
     signaling.connect(roomId, peerId.trim());
 
-    // Wait for signaling connection, then init WebRTC
     await new Promise<void>((resolve) => {
       const checkConnection = setInterval(() => {
         if (signaling.isConnected()) {
@@ -111,66 +104,44 @@ export default function App() {
       }, 5000);
     });
 
-    // Create PeerManager and initialize WebRTC
-    console.log(`[App] Initializing PeerManager, isInitiator=${isInitiator}`);
+    // PeerManager
     const peerManager = new PeerManager(signaling);
     peerRef.current = peerManager;
 
-    // Subscribe to PeerManager events
     peerManager.onConnectionStateChange((state: string) => {
-      console.log(`[App] Connection state changed: ${state}`);
       setConnectionStatus(state);
       setIsConnected(state === "connected");
     });
 
     peerManager.onDataChannelOpen(() => {
-      console.log("[App] DataChannel opened");
-      const dcState = peerManager.getChatChannelState();
-      const yjsState = peerManager.getYjsChannelState();
-      setDataChannelState(dcState ?? "N/A");
-      setYjsChannelState(yjsState ?? "N/A");
-      console.log(`[App] UI state updated: dataChannel=${dcState}, yjsChannel=${yjsState}`);
+      setDataChannelState(peerManager.getChatChannelState() ?? "N/A");
+      setYjsChannelState(peerManager.getYjsChannelState() ?? "N/A");
     });
 
     peerManager.onChatMessage((msg: string) => {
-      console.log(`[App] Received chat message: "${msg}"`);
       setChatMessages((prev) => [...prev, msg]);
     });
 
     await peerManager.init(isInitiator);
-    console.log("[App] PeerManager.init() completed");
 
-    // Update status
     setConnectionStatus(peerManager.getConnectionState());
     setDataChannelState(peerManager.getChatChannelState() ?? "N/A");
     setYjsChannelState(peerManager.getYjsChannelState() ?? "N/A");
 
-    // Create and initialize YjsManager
-    console.log(`[App] Initializing YjsManager with peerId=${peerId.trim()}`);
+    // YjsManager
     const yjsManager = new YjsManager(peerId.trim());
     yjsManager.init();
     yjsRef.current = yjsManager;
+    setActiveYjsManager(yjsManager);
     setYjsInitialized(yjsManager.isInitialized());
-    console.log("[App] YjsManager.init() completed, initialized:", yjsManager.isInitialized());
 
-    // Set up Yjs listeners
-    yjsManager.onObjectsChange(() => {
-      syncObjectList(yjsManager);
-    });
+    yjsManager.onObjectsChange(() => syncObjectList(yjsManager));
+    yjsManager.onNotesChange(() => syncNotes(yjsManager));
 
-    yjsManager.onNotesChange(() => {
-      syncNotes(yjsManager);
-    });
-
-    yjsManager.onRoomEvent((event, pId) => {
-      console.log(`[Yjs] Room event: ${event} from ${pId}`);
-    });
-
-    // Initial sync
     syncObjectList(yjsManager);
     syncNotes(yjsManager);
 
-    // Poll for DataChannels to open, then connect YjsManager to "yjs" channel
+    // Poll for DataChannels
     checkDcIntervalRef.current = setInterval(() => {
       const dcState = peerManager.getChatChannelState();
       const yjsState = peerManager.getYjsChannelState();
@@ -181,68 +152,48 @@ export default function App() {
         if (checkDcIntervalRef.current) {
           clearInterval(checkDcIntervalRef.current);
         }
-        // Access private yjsChannel via type assertion
         const pmAny = peerManager as unknown as Record<string, unknown>;
         const yjsDc = pmAny["yjsChannel"] as RTCDataChannel | undefined;
         if (yjsDc && yjsDc.readyState === "open") {
           yjsManager.connect(yjsDc);
           yjsConnectedRef.current = true;
-          console.log("[App] YjsManager connected to 'yjs' DataChannel");
           setConnectionStatus(`Connected (yjs bound)`);
         }
       }
 
-      // Update isConnected based on actual state
       setIsConnected(peerManager.areDataChannelsOpen());
     }, 200);
-
-    setAppStatus(
-      isInitiator
-        ? "Initiator (GM) — waiting for receiver..."
-        : "Receiver (Player) — waiting for offer..."
-    );
   };
 
-  // Helper to set status (kept for compatibility)
-  const setAppStatus = (status: string) => {
-    setConnectionStatus(status);
-  };
-
-  /**
-   * Send a chat message via the "chat" DataChannel.
-   */
+  // ─── Chat ───
   const handleSend = (): void => {
     if (!chatMessage.trim()) return;
     if (!peerRef.current?.sendChatMessage(chatMessage)) {
-      setAppStatus("Cannot send — DataChannel not open");
       return;
     }
     setChatMessages((prev) => [...prev, `[You] ${chatMessage}`]);
     setChatMessage("");
   };
 
-  /**
-   * Add a new table object via Yjs CRDT.
-   */
+  // ─── Yjs CRDT actions ───
   const handleAddObject = (): void => {
     const yjs = yjsRef.current;
     if (!yjs) {
       alert("YjsManager not initialized. Connect via WebRTC first.");
       return;
     }
+    const id = crypto.randomUUID();
+    console.log(`[App] Adding CRDT object: id=${id}, type=custom`);
     yjs.addObject({
       x: Math.round(Math.random() * 800),
       y: Math.round(Math.random() * 600),
       rotation: 0,
       scale: 1,
       type: "custom",
-      name: `Object ${objectList.size + 1}`,
+      name: `Object ${id.slice(0, 8)}`,
     });
   };
 
-  /**
-   * Update notes text via Yjs CRDT.
-   */
   const handleNotesChange = (e: React.ChangeEvent<HTMLTextAreaElement>): void => {
     const yjs = yjsRef.current;
     if (!yjs) return;
@@ -251,9 +202,44 @@ export default function App() {
     yjs.setNotesText(newText);
   };
 
-  /**
-   * Disconnect all connections.
-   */
+  // ─── Table actions — ALL objects go through Yjs only ───
+  const handleAddImage = (): void => {
+    const yjs = yjsRef.current;
+    if (!yjs) {
+      console.warn("[App] Yjs not initialized, cannot add image");
+      return;
+    }
+    const id = crypto.randomUUID();
+    console.log(`[App] Adding image to Yjs: id=${id}, x=100, y=100`);
+    yjs.addObject({
+      x: 100,
+      y: 100,
+      rotation: 0,
+      scale: 1,
+      type: "image",
+      name: id,
+    });
+  };
+
+  const handleAddNote = (): void => {
+    const yjs = yjsRef.current;
+    if (!yjs) {
+      console.warn("[App] Yjs not initialized, cannot add note");
+      return;
+    }
+    const id = crypto.randomUUID();
+    console.log(`[App] Adding note to Yjs: id=${id}, x=100, y=100`);
+    yjs.addObject({
+      x: 100,
+      y: 100,
+      rotation: 0,
+      scale: 1,
+      type: "note",
+      name: "New note",
+    });
+  };
+
+  // ─── Disconnect ───
   const handleDisconnect = (): void => {
     if (checkDcIntervalRef.current) {
       clearInterval(checkDcIntervalRef.current);
@@ -262,6 +248,7 @@ export default function App() {
     peerRef.current?.close();
     signalingRef.current?.disconnect();
     yjsRef.current = null;
+    setActiveYjsManager(undefined);
     peerRef.current = null;
     signalingRef.current = null;
     setConnectionStatus("Disconnected");
@@ -274,228 +261,290 @@ export default function App() {
     setNotesText("");
   };
 
+  // ─── Render ───
   return (
-    <div style={styles.container}>
-      <h1 style={styles.title}>OakTable WebRTC + Yjs CRDT Test</h1>
+    <div style={styles.root}>
+      {/* ─── Table Canvas Area ─── */}
+      <div style={styles.tableArea}>
+        <TableCanvas ref={tableCanvasRef} yjsManager={activeYjsManager} />
 
-      <div style={styles.section}>
-        <h3 style={styles.subtitle}>Connection</h3>
-        <div style={styles.field}>
-          <label style={styles.label}>Room ID:</label>
-          <input
-            style={styles.input}
-            type="text"
-            value={roomId}
-            onChange={(e) => setRoomId(e.target.value)}
-            placeholder="e.g. test"
-          />
-        </div>
-        <div style={styles.field}>
-          <label style={styles.label}>Peer ID:</label>
-          <input
-            style={styles.input}
-            type="text"
-            value={peerId}
-            onChange={(e) => setPeerId(e.target.value)}
-            placeholder="e.g. A or B"
-          />
-        </div>
-        <div style={styles.buttons}>
-          <button
-            style={{ ...styles.button, ...styles.initiatorButton }}
-            onClick={() => handleConnect(true)}
-          >
-            Connect as Initiator (GM)
+        {/* Toolbar overlay */}
+        <div style={styles.toolbar}>
+          <button style={styles.toolbarBtn} onClick={handleAddImage}>
+            🖼 Add Image
           </button>
-          <button
-            style={{ ...styles.button, ...styles.receiverButton }}
-            onClick={() => handleConnect(false)}
-          >
-            Connect as Receiver (Player)
+          <button style={styles.toolbarBtn} onClick={handleAddNote}>
+            📝 Add Note
           </button>
-          <button
-            style={{ ...styles.button, ...styles.disconnectButton }}
-            onClick={handleDisconnect}
-          >
-            Disconnect
-          </button>
+          <span style={styles.toolbarHint}>
+            Drag to pan · Scroll to zoom
+          </span>
         </div>
       </div>
 
-      <div style={styles.section}>
-        <h3 style={styles.subtitle}>Status</h3>
-        <p style={styles.status}>Connection: {connectionStatus}</p>
-        <p style={styles.status}>Chat DataChannel: {dataChannelState}</p>
-        <p style={styles.status}>Yjs DataChannel: {yjsChannelState}</p>
-        <p style={styles.status}>
-          P2P Connected: {isConnected ? "Yes" : "No"}
-        </p>
-        <p style={styles.status}>
-          Yjs Objects: {objectCount}
-        </p>
-        <p style={styles.status}>
-          Yjs Initialized: {yjsInitialized ? "Yes" : "No"}
-        </p>
-      </div>
+      {/* ─── Side Panel (Connection + Chat + Yjs) ─── */}
+      <div style={styles.panel}>
+        <h2 style={styles.panelTitle}>OakTable</h2>
 
-      {/* Yjs CRDT Sync Section */}
-      <div style={styles.section}>
-        <h3 style={styles.subtitle}>
-          Yjs CRDT Sync — Objects ({objectCount})
-        </h3>
-        <div style={{ marginBottom: 12 }}>
+        {/* Connection */}
+        <div style={styles.section}>
+          <h3 style={styles.sectionTitle}>Connection</h3>
+          <div style={styles.field}>
+            <label style={styles.label}>Room ID:</label>
+            <input
+              style={styles.input}
+              type="text"
+              value={roomId}
+              onChange={(e) => setRoomId(e.target.value)}
+            />
+          </div>
+          <div style={styles.field}>
+            <label style={styles.label}>Peer ID:</label>
+            <input
+              style={styles.input}
+              type="text"
+              value={peerId}
+              onChange={(e) => setPeerId(e.target.value)}
+              placeholder="e.g. A or B"
+            />
+          </div>
+          <div style={styles.connButtons}>
+            <button
+              style={{ ...styles.btn, ...styles.btnInitiator }}
+              onClick={() => handleConnect(true)}
+            >
+              Initiate (GM)
+            </button>
+            <button
+              style={{ ...styles.btn, ...styles.btnReceiver }}
+              onClick={() => handleConnect(false)}
+            >
+              Join (Player)
+            </button>
+            <button
+              style={{ ...styles.btn, ...styles.btnDisconnect }}
+              onClick={handleDisconnect}
+            >
+              Disconnect
+            </button>
+          </div>
+          <div style={styles.statusRow}>
+            Status: <strong>{connectionStatus}</strong>
+          </div>
+          <div style={styles.statusRow}>
+            Chat DC: <strong>{dataChannelState}</strong>
+          </div>
+          <div style={styles.statusRow}>
+            Yjs DC: <strong>{yjsChannelState}</strong>
+          </div>
+        </div>
+
+        {/* Yjs Objects */}
+        <div style={styles.section}>
+          <h3 style={styles.sectionTitle}>
+            Objects ({objectCount})
+          </h3>
           <button
-            style={{ ...styles.button, borderColor: "#9C27B0", color: "#9C27B0" }}
+            style={{ ...styles.btn, borderColor: "#9C27B0", color: "#9C27B0", marginBottom: 8 }}
             onClick={handleAddObject}
           >
-            Add Object
+            Add CRDT Object
           </button>
+          <div style={styles.listBox}>
+            {objectList.size === 0 && (
+              <span style={styles.placeholder}>No objects yet.</span>
+            )}
+            {Array.from(objectList.entries()).map(
+              ([id, data]: [string, TableObjectData]) => (
+                <div key={id} style={styles.listItem}>
+                  <strong>{data.name || id.slice(0, 8)}:</strong>{" "}
+                  x={data.x}, y={data.y}
+                </div>
+              )
+            )}
+          </div>
         </div>
-        <div style={styles.messagesBox}>
-          {objectList.size === 0 && (
-            <span style={styles.placeholder}>
-              No objects yet. Click "Add Object" to create one.
-            </span>
-          )}
-          {Array.from(objectList.entries()).map(
-            ([id, data]: [string, TableObjectData]) => (
-              <div key={id} style={styles.messageRow}>
-                <strong>{data.name || id.slice(0, 8)}:</strong>{" "}
-                x={data.x}, y={data.y}, rot={data.rotation}, scale={data.scale}
-              </div>
-            )
-          )}
-        </div>
-      </div>
 
-      <div style={styles.section}>
-        <h3 style={styles.subtitle}>Yjs CRDT Sync — Shared Notes</h3>
-        <p style={{ ...styles.status, fontSize: 12, color: "#666", marginBottom: 8 }}>
-          Edits are synced in real-time via Y.Text CRDT. Try typing in both tabs simultaneously.
-        </p>
-        <textarea
-          style={{ ...styles.input, minHeight: 100, resize: "vertical" }}
-          value={notesText}
-          onChange={handleNotesChange}
-          placeholder="Type shared notes here... (synced via Yjs Y.Text CRDT)"
-        />
-      </div>
-
-      <div style={styles.section}>
-        <h3 style={styles.subtitle}>Chat</h3>
-        <div style={styles.messagesBox}>
-          {chatMessages.length === 0 && (
-            <span style={styles.placeholder}>No messages yet.</span>
-          )}
-          {chatMessages.map((msg: string, i: number) => (
-            <div key={i} style={styles.messageRow}>
-              {msg}
-            </div>
-          ))}
-        </div>
-        <div style={styles.sendRow}>
-          <input
-            style={{ ...styles.input, flex: 1 }}
-            type="text"
-            value={chatMessage}
-            onChange={(e) => setChatMessage(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && handleSend()}
-            placeholder="Type a message..."
+        {/* Shared Notes */}
+        <div style={styles.section}>
+          <h3 style={styles.sectionTitle}>Shared Notes</h3>
+          <textarea
+            style={{ ...styles.input, minHeight: 80, resize: "vertical" }}
+            value={notesText}
+            onChange={handleNotesChange}
+            placeholder="Type notes..."
           />
-          <button style={styles.button} onClick={handleSend}>
-            Send
-          </button>
+        </div>
+
+        {/* Chat */}
+        <div style={styles.section}>
+          <h3 style={styles.sectionTitle}>Chat</h3>
+          <div style={styles.listBox}>
+            {chatMessages.length === 0 && (
+              <span style={styles.placeholder}>No messages.</span>
+            )}
+            {chatMessages.map((msg: string, i: number) => (
+              <div key={i} style={styles.listItem}>
+                {msg}
+              </div>
+            ))}
+          </div>
+          <div style={styles.sendRow}>
+            <input
+              style={{ ...styles.input, flex: 1 }}
+              type="text"
+              value={chatMessage}
+              onChange={(e) => setChatMessage(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && handleSend()}
+              placeholder="Type a message..."
+            />
+            <button style={styles.btn} onClick={handleSend}>Send</button>
+          </div>
         </div>
       </div>
     </div>
   );
 }
 
-// Inline styles
+// ─── Styles ───
 const styles: Record<string, React.CSSProperties> = {
-  container: {
-    maxWidth: 700,
-    margin: "40px auto",
-    padding: 24,
-    fontFamily: "monospace",
+  root: {
+    display: "flex",
+    height: "100vh",
+    overflow: "hidden",
+    fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
   },
-  title: {
-    textAlign: "center",
-    marginBottom: 24,
+  tableArea: {
+    flex: 1,
+    position: "relative",
+    overflow: "hidden",
+    background: "#e8e8e8",
   },
-  section: {
-    marginBottom: 20,
-    padding: 16,
+  toolbar: {
+    position: "absolute",
+    top: 12,
+    left: 12,
+    display: "flex",
+    gap: 8,
+    alignItems: "center",
+    background: "rgba(255,255,255,0.92)",
+    borderRadius: 8,
+    padding: "6px 12px",
+    boxShadow: "0 2px 8px rgba(0,0,0,0.12)",
+    zIndex: 10,
+  },
+  toolbarBtn: {
+    padding: "6px 14px",
+    fontSize: 13,
+    cursor: "pointer",
     border: "1px solid #ccc",
     borderRadius: 6,
+    background: "#fff",
+    transition: "background 0.15s",
   },
-  subtitle: {
-    margin: "0 0 12px 0",
+  toolbarHint: {
+    fontSize: 11,
+    color: "#888",
+    marginLeft: 8,
+  },
+  panel: {
+    width: 340,
+    overflowY: "auto",
+    borderLeft: "1px solid #e0e0e0",
+    background: "#fafafa",
+    padding: 16,
+    display: "flex",
+    flexDirection: "column" as const,
+    gap: 12,
+  },
+  panelTitle: {
+    margin: 0,
+    fontSize: 18,
+    fontWeight: 700,
+    borderBottom: "2px solid #2196F3",
+    paddingBottom: 8,
+  },
+  section: {
+    border: "1px solid #e0e0e0",
+    borderRadius: 8,
+    padding: 12,
+    background: "#fff",
+  },
+  sectionTitle: {
+    margin: "0 0 8px 0",
+    fontSize: 14,
+    fontWeight: 600,
   },
   field: {
-    marginBottom: 10,
+    marginBottom: 8,
   },
   label: {
     display: "block",
-    marginBottom: 4,
-    fontWeight: "bold",
+    marginBottom: 2,
+    fontSize: 12,
+    fontWeight: 600,
+    color: "#555",
   },
   input: {
     width: "100%",
-    padding: 8,
-    fontSize: 14,
-    fontFamily: "monospace",
-    boxSizing: "border-box",
+    padding: "6px 8px",
+    fontSize: 13,
+    border: "1px solid #ddd",
+    borderRadius: 4,
+    boxSizing: "border-box" as const,
   },
-  buttons: {
+  connButtons: {
     display: "flex",
-    gap: 8,
+    gap: 6,
     flexWrap: "wrap" as const,
   },
-  button: {
-    padding: "8px 16px",
-    fontSize: 14,
+  btn: {
+    padding: "5px 10px",
+    fontSize: 12,
     cursor: "pointer",
-    border: "1px solid #666",
+    border: "1px solid #999",
     borderRadius: 4,
     background: "#fff",
   },
-  initiatorButton: {
-    border: "2px solid #2196F3",
+  btnInitiator: {
+    borderColor: "#2196F3",
     color: "#2196F3",
   },
-  receiverButton: {
-    border: "2px solid #4CAF50",
+  btnReceiver: {
+    borderColor: "#4CAF50",
     color: "#4CAF50",
   },
-  disconnectButton: {
-    border: "2px solid #f44336",
+  btnDisconnect: {
+    borderColor: "#f44336",
     color: "#f44336",
   },
-  status: {
-    margin: "4px 0",
-    fontSize: 14,
+  statusRow: {
+    fontSize: 12,
+    margin: "3px 0",
+    color: "#555",
   },
-  messagesBox: {
-    minHeight: 120,
-    maxHeight: 240,
+  listBox: {
+    maxHeight: 120,
     overflowY: "auto" as const,
     border: "1px solid #eee",
-    padding: 8,
+    borderRadius: 4,
+    padding: 4,
     marginBottom: 8,
     background: "#fafafa",
   },
   placeholder: {
     color: "#999",
     fontStyle: "italic",
-  },
-  messageRow: {
+    fontSize: 12,
     padding: "4px 0",
-    borderBottom: "1px solid #eee",
-    fontSize: 13,
+  },
+  listItem: {
+    fontSize: 12,
+    padding: "3px 0",
+    borderBottom: "1px solid #f0f0f0",
   },
   sendRow: {
     display: "flex",
-    gap: 8,
+    gap: 6,
   },
 };
