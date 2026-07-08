@@ -13,17 +13,23 @@ import type { TableObjectData } from "./sync/yjsManager";
  * 3. Tab 2: enter room="test", peer="B", click "Connect as Receiver"
  * 4. Tab 1 clicks "Add Object" -> Tab 2 sees it in the list (synced via Yjs CRDT)
  * 5. Tab 1 types in notes -> Tab 2 sees it in real-time (synced via Y.Text)
+ * 6. Both tabs can chat via "chat" DataChannel
  *
- * Yjs CRDT ensures that simultaneous edits from both tabs are resolved
- * automatically without conflicts — all peers eventually see the same state.
+ * Two DataChannels:
+ *   - "chat"  — plain text chat messages
+ *   - "yjs"   — Yjs CRDT binary/JSON updates
  */
 
 export default function App() {
   const [roomId, setRoomId] = useState("test");
   const [peerId, setPeerId] = useState("");
-  const [message, setMessage] = useState("");
-  const [receivedMessages, setReceivedMessages] = useState<string[]>([]);
-  const [status, setStatus] = useState<string>("Disconnected");
+  const [chatMessage, setChatMessage] = useState("");
+  const [chatMessages, setChatMessages] = useState<string[]>([]);
+  const [connectionStatus, setConnectionStatus] = useState<string>("Disconnected");
+  const [dataChannelState, setDataChannelState] = useState<string>("N/A");
+  const [yjsChannelState, setYjsChannelState] = useState<string>("N/A");
+  const [isConnected, setIsConnected] = useState(false);
+  const [yjsInitialized, setYjsInitialized] = useState(false);
 
   // Yjs CRDT state
   const [objectCount, setObjectCount] = useState(0);
@@ -34,6 +40,7 @@ export default function App() {
   const peerRef = useRef<PeerManager | null>(null);
   const yjsRef = useRef<YjsManager | null>(null);
   const checkDcIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const yjsConnectedRef = useRef(false);
 
   // Clean up WebRTC resources on unmount
   useEffect(() => {
@@ -69,8 +76,12 @@ export default function App() {
     }
 
     // Reset state
-    setReceivedMessages([]);
-    setStatus("Connecting...");
+    setChatMessages([]);
+    setConnectionStatus("Connecting...");
+    setDataChannelState("N/A");
+    setYjsChannelState("N/A");
+    setIsConnected(false);
+    yjsConnectedRef.current = false;
 
     // Clean up previous connections
     yjsRef.current?.close();
@@ -94,7 +105,6 @@ export default function App() {
           resolve();
         }
       }, 100);
-      // Timeout after 5 seconds
       setTimeout(() => {
         clearInterval(checkConnection);
         resolve();
@@ -102,16 +112,48 @@ export default function App() {
     });
 
     // Create PeerManager and initialize WebRTC
+    console.log(`[App] Initializing PeerManager, isInitiator=${isInitiator}`);
     const peerManager = new PeerManager(signaling);
     peerRef.current = peerManager;
+
+    // Subscribe to PeerManager events
+    peerManager.onConnectionStateChange((state: string) => {
+      console.log(`[App] Connection state changed: ${state}`);
+      setConnectionStatus(state);
+      setIsConnected(state === "connected");
+    });
+
+    peerManager.onDataChannelOpen(() => {
+      console.log("[App] DataChannel opened");
+      const dcState = peerManager.getChatChannelState();
+      const yjsState = peerManager.getYjsChannelState();
+      setDataChannelState(dcState ?? "N/A");
+      setYjsChannelState(yjsState ?? "N/A");
+      console.log(`[App] UI state updated: dataChannel=${dcState}, yjsChannel=${yjsState}`);
+    });
+
+    peerManager.onChatMessage((msg: string) => {
+      console.log(`[App] Received chat message: "${msg}"`);
+      setChatMessages((prev) => [...prev, msg]);
+    });
+
     await peerManager.init(isInitiator);
+    console.log("[App] PeerManager.init() completed");
+
+    // Update status
+    setConnectionStatus(peerManager.getConnectionState());
+    setDataChannelState(peerManager.getChatChannelState() ?? "N/A");
+    setYjsChannelState(peerManager.getYjsChannelState() ?? "N/A");
 
     // Create and initialize YjsManager
+    console.log(`[App] Initializing YjsManager with peerId=${peerId.trim()}`);
     const yjsManager = new YjsManager(peerId.trim());
     yjsManager.init();
     yjsRef.current = yjsManager;
+    setYjsInitialized(yjsManager.isInitialized());
+    console.log("[App] YjsManager.init() completed, initialized:", yjsManager.isInitialized());
 
-    // Set up Yjs listeners for UI updates BEFORE connecting DataChannel
+    // Set up Yjs listeners
     yjsManager.onObjectsChange(() => {
       syncObjectList(yjsManager);
     });
@@ -128,47 +170,59 @@ export default function App() {
     syncObjectList(yjsManager);
     syncNotes(yjsManager);
 
-    // Poll for DataChannel open state, then connect to YjsManager
+    // Poll for DataChannels to open, then connect YjsManager to "yjs" channel
     checkDcIntervalRef.current = setInterval(() => {
-      const dcState = peerManager.getDataChannelState();
-      if (dcState === "open") {
+      const dcState = peerManager.getChatChannelState();
+      const yjsState = peerManager.getYjsChannelState();
+      setDataChannelState(dcState ?? "N/A");
+      setYjsChannelState(yjsState ?? "N/A");
+
+      if (yjsState === "open" && !yjsConnectedRef.current) {
         if (checkDcIntervalRef.current) {
           clearInterval(checkDcIntervalRef.current);
         }
-        // Access private dataChannel via type assertion
+        // Access private yjsChannel via type assertion
         const pmAny = peerManager as unknown as Record<string, unknown>;
-        const dc = pmAny["dataChannel"] as RTCDataChannel | undefined;
-        if (dc && dc.readyState === "open") {
-          yjsManager.connect(dc);
-          console.log("[App] YjsManager connected to DataChannel");
+        const yjsDc = pmAny["yjsChannel"] as RTCDataChannel | undefined;
+        if (yjsDc && yjsDc.readyState === "open") {
+          yjsManager.connect(yjsDc);
+          yjsConnectedRef.current = true;
+          console.log("[App] YjsManager connected to 'yjs' DataChannel");
+          setConnectionStatus(`Connected (yjs bound)`);
         }
       }
+
+      // Update isConnected based on actual state
+      setIsConnected(peerManager.areDataChannelsOpen());
     }, 200);
 
-    setStatus(
+    setAppStatus(
       isInitiator
         ? "Initiator (GM) — waiting for receiver..."
         : "Receiver (Player) — waiting for offer..."
     );
   };
 
+  // Helper to set status (kept for compatibility)
+  const setAppStatus = (status: string) => {
+    setConnectionStatus(status);
+  };
+
   /**
-   * Send a message via the DataChannel to the remote peer.
+   * Send a chat message via the "chat" DataChannel.
    */
   const handleSend = (): void => {
-    if (!message.trim()) return;
-    if (!peerRef.current?.sendMessage(message)) {
-      setStatus("Cannot send — DataChannel not open");
+    if (!chatMessage.trim()) return;
+    if (!peerRef.current?.sendChatMessage(chatMessage)) {
+      setAppStatus("Cannot send — DataChannel not open");
       return;
     }
-    setReceivedMessages((prev) => [...prev, `[You] ${message}`]);
-    setMessage("");
+    setChatMessages((prev) => [...prev, `[You] ${chatMessage}`]);
+    setChatMessage("");
   };
 
   /**
    * Add a new table object via Yjs CRDT.
-   * This creates a new entry in Y.Map "objects" with random position.
-   * All connected peers will see this change in real-time.
    */
   const handleAddObject = (): void => {
     const yjs = yjsRef.current;
@@ -188,11 +242,8 @@ export default function App() {
 
   /**
    * Update notes text via Yjs CRDT.
-   * Y.Text will automatically sync changes to peers.
    */
-  const handleNotesChange = (
-    e: React.ChangeEvent<HTMLTextAreaElement>
-  ): void => {
+  const handleNotesChange = (e: React.ChangeEvent<HTMLTextAreaElement>): void => {
     const yjs = yjsRef.current;
     if (!yjs) return;
     const newText = e.target.value;
@@ -213,8 +264,11 @@ export default function App() {
     yjsRef.current = null;
     peerRef.current = null;
     signalingRef.current = null;
-    setStatus("Disconnected");
-    setReceivedMessages([]);
+    setConnectionStatus("Disconnected");
+    setDataChannelState("N/A");
+    setYjsChannelState("N/A");
+    setIsConnected(false);
+    setChatMessages([]);
     setObjectCount(0);
     setObjectList(new Map());
     setNotesText("");
@@ -270,18 +324,17 @@ export default function App() {
 
       <div style={styles.section}>
         <h3 style={styles.subtitle}>Status</h3>
-        <p style={styles.status}>Status: {status}</p>
+        <p style={styles.status}>Connection: {connectionStatus}</p>
+        <p style={styles.status}>Chat DataChannel: {dataChannelState}</p>
+        <p style={styles.status}>Yjs DataChannel: {yjsChannelState}</p>
         <p style={styles.status}>
-          DataChannel: {peerRef.current?.getDataChannelState() ?? "N/A"}
-        </p>
-        <p style={styles.status}>
-          P2P Connected: {peerRef.current?.isConnected() ? "Yes" : "No"}
+          P2P Connected: {isConnected ? "Yes" : "No"}
         </p>
         <p style={styles.status}>
           Yjs Objects: {objectCount}
         </p>
         <p style={styles.status}>
-          Yjs Initialized: {yjsRef.current?.isInitialized() ? "Yes" : "No"}
+          Yjs Initialized: {yjsInitialized ? "Yes" : "No"}
         </p>
       </div>
 
@@ -307,11 +360,8 @@ export default function App() {
           {Array.from(objectList.entries()).map(
             ([id, data]: [string, TableObjectData]) => (
               <div key={id} style={styles.messageRow}>
-                <strong>
-                  {data.name || id.slice(0, 8)}
-                </strong>:{", "}
-                x={data.x}, y={data.y}, rot={data.rotation}, scale=
-                {data.scale}
+                <strong>{data.name || id.slice(0, 8)}:</strong>{" "}
+                x={data.x}, y={data.y}, rot={data.rotation}, scale={data.scale}
               </div>
             )
           )}
@@ -320,16 +370,8 @@ export default function App() {
 
       <div style={styles.section}>
         <h3 style={styles.subtitle}>Yjs CRDT Sync — Shared Notes</h3>
-        <p
-          style={{
-            ...styles.status,
-            fontSize: 12,
-            color: "#666",
-            marginBottom: 8,
-          }}
-        >
-          Edits are synced in real-time via Y.Text CRDT. Try typing in both
-          tabs simultaneously.
+        <p style={{ ...styles.status, fontSize: 12, color: "#666", marginBottom: 8 }}>
+          Edits are synced in real-time via Y.Text CRDT. Try typing in both tabs simultaneously.
         </p>
         <textarea
           style={{ ...styles.input, minHeight: 100, resize: "vertical" }}
@@ -340,12 +382,12 @@ export default function App() {
       </div>
 
       <div style={styles.section}>
-        <h3 style={styles.subtitle}>Messages</h3>
+        <h3 style={styles.subtitle}>Chat</h3>
         <div style={styles.messagesBox}>
-          {receivedMessages.length === 0 && (
+          {chatMessages.length === 0 && (
             <span style={styles.placeholder}>No messages yet.</span>
           )}
-          {receivedMessages.map((msg: string, i: number) => (
+          {chatMessages.map((msg: string, i: number) => (
             <div key={i} style={styles.messageRow}>
               {msg}
             </div>
@@ -355,8 +397,8 @@ export default function App() {
           <input
             style={{ ...styles.input, flex: 1 }}
             type="text"
-            value={message}
-            onChange={(e) => setMessage(e.target.value)}
+            value={chatMessage}
+            onChange={(e) => setChatMessage(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && handleSend()}
             placeholder="Type a message..."
           />
@@ -369,7 +411,7 @@ export default function App() {
   );
 }
 
-// Inline styles for simplicity (no CSS dependency in Phase 1)
+// Inline styles
 const styles: Record<string, React.CSSProperties> = {
   container: {
     maxWidth: 700,

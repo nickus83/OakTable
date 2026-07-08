@@ -10,7 +10,10 @@ Signaling flow:
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from signaling import router as signaling_router
+try:
+    from .signaling import router as signaling_router
+except ImportError:
+    from signaling import router as signaling_router
 
 app = FastAPI(title="OakTable Signaling Server", version="0.1.0")
 

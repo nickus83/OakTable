@@ -196,9 +196,9 @@ export class YjsManager {
   }
 
   /**
-   * Подключение к DataChannel для отправки/получения Yjs updates.
+   * Подключение к "yjs" DataChannel для отправки/получения Yjs updates.
    *
-   * @param dataChannel — WebRTC DataChannel для передачи updates
+   * @param dataChannel — WebRTC DataChannel с label="yjs" для передачи Yjs CRDT updates
    */
   connect(dataChannel: RTCDataChannel): void {
     if (!dataChannel) {
@@ -206,11 +206,18 @@ export class YjsManager {
       return;
     }
 
+    // Only bind to "yjs" channel
+    if (dataChannel.label !== "yjs") {
+      console.warn(`[YjsManager] ⚠ Attempted to bind to "${dataChannel.label}" channel, expected "yjs". Ignoring.`);
+      return;
+    }
+
     this.dataChannel = dataChannel;
+    console.log(`[YjsManager] ✓ Bound to "yjs" DataChannel for peer: ${this.localPeerId}`);
 
     // При открытии DataChannel отправляем sync-request и свой полный state
     dataChannel.addEventListener("open", () => {
-      console.log(`[YjsManager] DataChannel opened for peer: ${this.localPeerId}`);
+      console.log(`[YjsManager] ✓ "yjs" DataChannel OPENED for peer: ${this.localPeerId}`);
 
       // Отправляем sync-request для запроса полного state от удалённого пира
       this.sendRoomMessage({
@@ -227,27 +234,29 @@ export class YjsManager {
       });
     });
 
-    // При получении сообщения
+    // При получении сообщения — только от Yjs канала
     dataChannel.addEventListener("message", (event: MessageEvent) => {
       try {
         const message = JSON.parse(event.data as string) as YjsUpdateMessage | YjsRoomMessage;
+        const msgAny = message as unknown as Record<string, unknown>;
+        console.log(`[YjsManager] ← Received on "yjs" channel, type: ${msgAny.type ?? (msgAny.__yjs__ ? "yjs-update" : "unknown")}`);
         this.handleIncomingMessage(message);
       } catch (_err) {
         const err = _err;
-        console.error("[YjsManager] Failed to parse incoming message:", err);
+        console.error("[YjsManager] Failed to parse incoming message on 'yjs' channel:", err, "raw:", String(event.data).substring(0, 200));
       }
     });
 
     dataChannel.addEventListener("close", () => {
-      console.log(`[YjsManager] DataChannel closed for peer: ${this.localPeerId}`);
+      console.log(`[YjsManager] "yjs" DataChannel closed for peer: ${this.localPeerId}`);
       this.dataChannel = null;
     });
 
     dataChannel.addEventListener("error", (event: Event) => {
-      console.error("[YjsManager] DataChannel error:", event);
+      console.error("[YjsManager] 'yjs' DataChannel error:", event);
     });
 
-    console.log(`[YjsManager] Connected to DataChannel for peer: ${this.localPeerId}`);
+    console.log(`[YjsManager] Connected to "yjs" DataChannel for peer: ${this.localPeerId}`);
   }
 
   /**
