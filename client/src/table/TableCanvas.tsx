@@ -4,6 +4,7 @@ import * as Y from "yjs";
 import { YjsManager } from "../sync/yjsManager";
 import { TableObject } from "./TableObject";
 import type { TableObjectType } from "./TableObject";
+import type { FileMetadata } from "../webrtc/fileTransfer";
 
 // ==================== Types ====================
 
@@ -14,6 +15,7 @@ export interface TableCanvasRef {
   addImage: (id: string, x?: number, y?: number) => void;
   addNote: (id: string, text?: string, x?: number, y?: number) => void;
   removeObject: (id: string) => void;
+  loadFileBlob: (fileId: string, blob: Blob) => void;
 }
 
 export interface TableCanvasProps {
@@ -21,7 +23,20 @@ export interface TableCanvasProps {
   yjsManager?: YjsManager;
 }
 
-// ==================== Helpers ====================
+// ==================== Blob & Texture Cache ====================
+
+/**
+ * Cache for received file blobs and their loaded PixiJS textures.
+ * Key: fileId (Yjs object ID)
+ */
+export interface FileBlobCache {
+  /** Maps fileId → Blob */
+  blobs: Map<string, Blob>;
+  /** Maps fileId → Object URL for texture loading */
+  objectUrls: Map<string, string>;
+  /** Maps fileId → loaded texture */
+  textures: Map<string, PIXI.Texture>;
+}
 
 /** Yjs Y.Map "objects" type for typed access */
 type ObjectsYMap = Y.Map<Y.Map<unknown>>;
@@ -29,10 +44,11 @@ type ObjectsYMap = Y.Map<Y.Map<unknown>>;
 /**
  * Convert Y.Map data to TableObject params.
  */
-function yMapToData(yMap: Y.Map<unknown>): { x: number; y: number; type: TableObjectType; content?: string; name?: string } {
+function yMapToData(yMap: Y.Map<unknown>): { x: number; y: number; type: TableObjectType; content?: string; name?: string; fileId?: string } {
   let x = 0, y = 0, scale = 1, rotation = 0;
   let type: TableObjectType = "image";
   let name: string | undefined;
+  let fileId: string | undefined;
 
   yMap.forEach((v, k) => {
     if (k === "x" && typeof v === "number") x = v;
@@ -41,9 +57,84 @@ function yMapToData(yMap: Y.Map<unknown>): { x: number; y: number; type: TableOb
     else if (k === "rotation" && typeof v === "number") rotation = v;
     else if (k === "type" && typeof v === "string") type = (v as "image" | "note" | "custom") === "note" ? "note" : "image";
     else if (k === "name" && typeof v === "string") name = v;
+    else if (k === "fileId" && typeof v === "string") fileId = v;
   });
 
-  return { x, y, type, content: name, name };
+  return { x, y, type, content: name, name, fileId };
+}
+
+/**
+ * Load a PixiJS texture from a blob in the file cache.
+ * Returns the sprite if the texture is already cached, null otherwise.
+ * If the file is not yet available, starts async loading and returns null.
+ * Uses HTMLImageElement → PIXI.Texture.from() instead of PIXI.Assets.load() for blob URLs.
+ */
+function loadTextureFromFileId(
+  fileId: string,
+  fileCache: FileBlobCache,
+  appRef: React.MutableRefObject<PIXI.Application | null>,
+  width: number = 200,
+  height: number = 150
+): PIXI.Sprite | null {
+  const app = appRef.current;
+  if (!app) return null;
+
+  // Check if texture is already cached
+  const cachedTexture = fileCache.textures.get(fileId);
+  if (cachedTexture) {
+    const sprite = new PIXI.Sprite(cachedTexture);
+    const aspect = cachedTexture.width / cachedTexture.height;
+    if (aspect > 1) {
+      sprite.width = width;
+      sprite.height = width / aspect;
+    } else {
+      sprite.height = height;
+      sprite.width = height * aspect;
+    }
+    sprite.anchor.set(0.5);
+    return sprite;
+  }
+
+  // Check if blob is available
+  const blob = fileCache.blobs.get(fileId);
+  if (!blob) {
+    return null; // File not received yet
+  }
+
+  // Check if we already created an object URL for this blob
+  let objectUrl = fileCache.objectUrls.get(fileId);
+  
+  // Start async texture loading if not already in progress
+  if (!objectUrl) {
+    objectUrl = URL.createObjectURL(blob);
+    fileCache.objectUrls.set(fileId, objectUrl);
+
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const texture = PIXI.Texture.from(img);
+        fileCache.textures.set(fileId, texture);
+        console.log(`[TableCanvas] loadTextureFromFileId: texture async loaded for fileId: ${fileId}, dimensions: ${texture.width}x${texture.height}`);
+      } catch (error) {
+        console.error(`[TableCanvas] Failed to create PIXI texture from image for fileId ${fileId}:`, error);
+      } finally {
+        URL.revokeObjectURL(objectUrl!);
+        fileCache.objectUrls.delete(fileId);
+      }
+    };
+    
+    img.onerror = () => {
+      console.error(`[TableCanvas] Failed to load image from blob for fileId ${fileId}:`, objectUrl);
+      URL.revokeObjectURL(objectUrl!);
+      fileCache.objectUrls.delete(fileId);
+    };
+    
+    img.src = objectUrl;
+  }
+
+  // Return null — texture will be loaded asynchronously
+  // The Yjs observer will pick up the cached texture on next render cycle
+  return null;
 }
 
 /**
@@ -53,11 +144,12 @@ function yMapToData(yMap: Y.Map<unknown>): { x: number; y: number; type: TableOb
 function renderObjectFromData(
   objectId: string,
   type: TableObjectType,
-  data: { x: number; y: number; content?: string },
+  data: { x: number; y: number; content?: string; fileId?: string },
   tableObjectsRef: React.MutableRefObject<TableObjectMap>,
   objectsLayerRef: React.MutableRefObject<PIXI.Container | null>,
   appRef: React.MutableRefObject<PIXI.Application | null>,
-  yjsRef: React.MutableRefObject<YjsManager | undefined>
+  yjsRef: React.MutableRefObject<YjsManager | undefined>,
+  fileCache: FileBlobCache
 ): TableObject {
   const app = appRef.current;
   const layer = objectsLayerRef.current;
@@ -72,9 +164,81 @@ function renderObjectFromData(
     return existing;
   }
 
+  // For image objects with fileId, check if we have a cached texture
+  let contentSource: string | undefined = data.content;
+  if (type === "image" && data.fileId) {
+    const cachedTexture = fileCache.textures.get(data.fileId);
+    if (cachedTexture) {
+      // Texture already loaded — create sprite directly
+      const sprite = new PIXI.Sprite(cachedTexture);
+      const aspect = cachedTexture.width / cachedTexture.height;
+      let w = 200, h = 150;
+      if (aspect > 1) {
+        sprite.width = w;
+        sprite.height = w / aspect;
+      } else {
+        sprite.height = h;
+        sprite.width = h * aspect;
+      }
+      sprite.anchor.set(0.5);
+
+      const obj = new TableObject(
+        { id: objectId, type, x: data.x, y: data.y },
+        app
+      );
+      // Replace placeholder with sprite
+      obj.container.removeChildren();
+      obj.container.addChild(sprite);
+      // Re-add border (need to access private method via re-creation)
+      const border = new PIXI.Graphics();
+      border.lineStyle(2, 0x666666, 0.4);
+      border.drawRoundedRect(-3, -3, w + 6, h + 6, 6);
+      border.interactive = false;
+      border.eventMode = "none";
+      obj.container.addChild(border);
+
+      tableObjectsRef.current[objectId] = obj;
+      layer.addChild(obj.container);
+
+      obj.onDrag((id: string, x: number, y: number) => {
+        const yjs = yjsRef.current;
+        if (yjs) {
+          yjs.updateObject(id, { x, y });
+        }
+      });
+
+      console.log(`[TableCanvas] Rendered object with cached texture: id=${objectId}, fileId=${data.fileId}`);
+      return obj;
+    }
+
+    // File blob is available but texture not yet cached — start async loading
+    // We'll create the TableObject with fileId, and update the sprite texture when loading completes
+    const blob = fileCache.blobs.get(data.fileId!);
+    if (blob) {
+      console.log(`[TableCanvas] Blob available for fileId ${data.fileId}, starting async texture load`);
+      
+      // Start async texture loading — it will update the TableObject when done
+      loadTextureFromBlob(data.fileId!, blob)
+        .then((texture) => {
+          const existingObj = tableObjectsRef.current[objectId];
+          if (existingObj) {
+            existingObj.updateTexture(texture);
+            console.log(`[TableCanvas] Sprite texture applied: id=${objectId}, fileId=${data.fileId}`);
+          }
+        })
+        .catch((error) => {
+          console.error(`[TableCanvas] Failed to load texture for sprite: id=${objectId}, fileId=${data.fileId}`, error);
+        });
+    }
+    
+    // File not yet received — use fileId as content marker
+    // TableObject will show placeholder, and updateTexture will be called later
+    contentSource = undefined;
+  }
+
   // Create new TableObject
   const obj = new TableObject(
-    { id: objectId, type, x: data.x, y: data.y, content: data.content },
+    { id: objectId, type, x: data.x, y: data.y, content: contentSource, fileId: data.fileId },
     app
   );
 
@@ -95,13 +259,16 @@ function renderObjectFromData(
 
 /**
  * Update existing PixiJS object position/scale/rotation from Yjs data.
+ * Also checks for fileId-based texture updates.
  * Returns true if object was found and updated.
  */
 function updateObjectInPixi(
   objectId: string,
   yMapData: Y.Map<unknown>,
   tableObjectsRef: React.MutableRefObject<TableObjectMap>,
-  objectsLayerRef: React.MutableRefObject<PIXI.Container | null>
+  objectsLayerRef: React.MutableRefObject<PIXI.Container | null>,
+  fileCache: FileBlobCache,
+  appRef: React.MutableRefObject<PIXI.Application | null>
 ): boolean {
   const layer = objectsLayerRef.current;
   if (!layer) return false;
@@ -123,6 +290,123 @@ function updateObjectInPixi(
   }
 
   return false;
+}
+
+/**
+ * Try to update a TableObject with a texture from a received file.
+ * Returns true if an update was performed.
+ */
+function updateObjectTextureFromFile(
+  objectId: string,
+  fileId: string,
+  fileCache: FileBlobCache,
+  tableObjectsRef: React.MutableRefObject<TableObjectMap>,
+  appRef: React.MutableRefObject<PIXI.Application | null>
+): boolean {
+  const existing = tableObjectsRef.current[objectId];
+  if (!existing) return false;
+
+  // Check if we have a cached texture
+  const cachedTexture = fileCache.textures.get(fileId);
+  if (cachedTexture) {
+    existing.updateTexture(cachedTexture);
+    console.log(`[TableCanvas] Updated object texture: id=${objectId}, fileId=${fileId}`);
+    return true;
+  }
+
+  // Check if we have a blob but texture not yet loaded
+  const blob = fileCache.blobs.get(fileId);
+  if (blob) {
+    // Texture loading was initiated in onFileReceived callback
+    return false;
+  }
+
+  return false;
+}
+
+/**
+ * Load a texture from a Blob using HTMLImageElement as intermediate step.
+ * PixiJS v7 Assets loader doesn't handle blob URLs reliably, so we use
+ * HTMLImageElement which PixiJS.from() can then convert to a Texture.
+ */
+function loadTextureFromBlob(fileId: string, blob: Blob): Promise<PIXI.Texture> {
+  return new Promise((resolve, reject) => {
+    const blobUrl = URL.createObjectURL(blob);
+    
+    console.log(`[TableCanvas] Creating HTMLImageElement from blob: fileId=${fileId}, size=${blob.size}, type=${blob.type}`);
+    
+    const img = new Image();
+    
+    img.onload = () => {
+      console.log(`[TableCanvas] Image loaded: fileId=${fileId}, width=${img.width}, height=${img.height}`);
+      try {
+        const texture = PIXI.Texture.from(img);
+        console.log(`[TableCanvas] Texture created from image: fileId=${fileId}, texWidth=${texture.width}, texHeight=${texture.height}`);
+        URL.revokeObjectURL(blobUrl);
+        resolve(texture);
+      } catch (error) {
+        console.error(`[TableCanvas] Failed to create PIXI texture from image:`, error);
+        URL.revokeObjectURL(blobUrl);
+        reject(error);
+      }
+    };
+    
+    img.onerror = (error) => {
+      console.error(`[TableCanvas] Failed to load image from blob: fileId=${fileId}, error=`, error);
+      URL.revokeObjectURL(blobUrl);
+      reject(new Error(`Failed to load image from blob for fileId ${fileId}`));
+    };
+    
+    img.src = blobUrl;
+  });
+}
+
+/**
+ * Load a file blob into the cache and render/update the corresponding PixiJS object.
+ * Called when a file is received via P2P file transfer.
+ * Uses HTMLImageElement → PIXI.Texture.from() instead of PIXI.Assets.load() for blob URLs.
+ */
+async function loadFileBlobIntoCache(
+  fileId: string,
+  blob: Blob,
+  fileCache: FileBlobCache,
+  appRef: React.MutableRefObject<PIXI.Application | null>,
+  tableObjectsRef: React.MutableRefObject<TableObjectMap>,
+  yjsManager: YjsManager | undefined
+): Promise<void> {
+  console.log(`[TableCanvas] Loading file blob: fileId=${fileId}, size=${blob.size} bytes, type=${blob.type}`);
+
+  // Skip if texture already cached
+  if (fileCache.textures.has(fileId)) {
+    console.log(`[TableCanvas] Texture already cached for fileId: ${fileId}, skipping`);
+    return;
+  }
+
+  // Store blob
+  fileCache.blobs.set(fileId, blob);
+
+  // Log blob MIME type for debugging
+  console.log(`[TableCanvas] Creating texture from blob: type=${blob.type}, size=${blob.size}, fileId=${fileId}`);
+  if (!blob.type) {
+    console.warn(`[TableCanvas] WARNING: Blob has no MIME type (type="${blob.type}"), texture may fail to load with PixiJS`);
+  }
+
+  // Load texture using HTMLImageElement approach (avoids PixiJS Assets blob URL issues)
+  try {
+    const texture = await loadTextureFromBlob(fileId, blob);
+    console.log(`[TableCanvas] Texture loaded and cached for fileId: ${fileId}, dimensions: ${texture.width}x${texture.height}`);
+    fileCache.textures.set(fileId, texture);
+
+    // Update all TableObjects referencing this fileId
+    for (const [objectId, tableObj] of Object.entries(tableObjectsRef.current)) {
+      if (tableObj.fileId === fileId) {
+        tableObj.updateTexture(texture);
+        console.log(`[TableCanvas] Updated TableObject ${objectId} with texture for fileId ${fileId}`);
+      }
+    }
+  } catch (err) {
+    console.error(`[TableCanvas] Failed to load texture for fileId ${fileId}:`, err);
+  }
 }
 
 /**
@@ -157,7 +441,8 @@ function subscribeToYjsDirect(
   tableObjectsRef: React.MutableRefObject<TableObjectMap>,
   objectsLayerRef: React.MutableRefObject<PIXI.Container | null>,
   appRef: React.MutableRefObject<PIXI.Application | null>,
-  yjsRef: React.MutableRefObject<YjsManager | undefined>
+  yjsRef: React.MutableRefObject<YjsManager | undefined>,
+  fileCacheRef: React.MutableRefObject<FileBlobCache>
 ): () => void {
   const doc = yjsManager.getDoc();
   const objectsMap: ObjectsYMap = doc.getMap("objects");
@@ -183,7 +468,7 @@ function subscribeToYjsDirect(
         const data = yMapToData(yMapValue);
         console.log(`[TableCanvas] Shallow ADD: creating PixiJS object id=${key} type=${data.type}`);
         try {
-          renderObjectFromData(key, data.type, { x: data.x, y: data.y, content: data.content }, tableObjectsRef, objectsLayerRef, appRef, yjsRef);
+          renderObjectFromData(key, data.type, { x: data.x, y: data.y, content: data.content, fileId: data.fileId }, tableObjectsRef, objectsLayerRef, appRef, yjsRef, fileCacheRef.current);
         } catch (err) {
           console.warn(`[TableCanvas] Could not render object ${key}:`, err);
         }
@@ -253,7 +538,7 @@ function subscribeToYjsDirect(
       console.log(`[TableCanvas] Deep change data for ${objectId}: x=${xVal}, y=${yVal}, rot=${rotVal}, scale=${scaleVal}`);
 
       if (typeof xVal === "number" && typeof yVal === "number") {
-        updateObjectInPixi(objectId, yMapValue, tableObjectsRef, objectsLayerRef);
+        updateObjectInPixi(objectId, yMapValue, tableObjectsRef, objectsLayerRef, fileCacheRef.current, appRef);
       }
     }
   });
@@ -264,7 +549,7 @@ function subscribeToYjsDirect(
   for (const [id, data] of existingObjects) {
     const type: TableObjectType = data.type === "note" ? "note" : "image";
     try {
-      renderObjectFromData(id, type, { x: data.x, y: data.y, content: data.name }, tableObjectsRef, objectsLayerRef, appRef, yjsRef);
+      renderObjectFromData(id, type, { x: data.x, y: data.y, content: data.name, fileId: data.fileId }, tableObjectsRef, objectsLayerRef, appRef, yjsRef, fileCacheRef.current);
     } catch (err) {
       console.warn(`[TableCanvas] Could not render object ${id} during initial sync:`, err);
     }
@@ -297,6 +582,8 @@ const TableCanvas = React.forwardRef<TableCanvasRef, TableCanvasProps>(
     const tableObjectsRef = useRef<TableObjectMap>({});
     // YjsManager ref for drag callbacks
     const yjsRef = useRef<YjsManager | undefined>(undefined);
+    // File blob & texture cache
+    const fileCacheRef = useRef<FileBlobCache>({ blobs: new Map(), objectUrls: new Map(), textures: new Map() });
     // Unsubscribe callbacks from Yjs listeners
     const unsubscribeYjsRef = useRef<(() => void) | null>(null);
     // Track whether we're subscribed to prevent duplicate subscriptions
@@ -517,6 +804,9 @@ const TableCanvas = React.forwardRef<TableCanvasRef, TableCanvasProps>(
       addImage,
       addNote,
       removeObject,
+      loadFileBlob(fileId: string, blob: Blob): void {
+        loadFileBlobIntoCache(fileId, blob, fileCacheRef.current, appRef, tableObjectsRef, yjsRef.current);
+      },
     }), [addImage, addNote, removeObject]);
 
     // ==================== Lifecycle ====================
@@ -534,7 +824,8 @@ const TableCanvas = React.forwardRef<TableCanvasRef, TableCanvasProps>(
           tableObjectsRef,
           objectsLayerRef,
           appRef,
-          yjsRef
+          yjsRef,
+          fileCacheRef
         );
         console.log("[TableCanvas] Yjs subscription activated");
       }

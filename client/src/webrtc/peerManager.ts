@@ -57,6 +57,7 @@ export class PeerManager {
   private peerConnection: RTCPeerConnection | null = null;
   private chatChannel: RTCDataChannel | null = null;
   private yjsChannel: RTCDataChannel | null = null;
+  private filesChannel: RTCDataChannel | null = null;
   private receivedChatMessages: string[] = [];
 
   // Callback systems for UI events
@@ -64,6 +65,11 @@ export class PeerManager {
   private onConnectionStateChangeCallbacks: Array<(state: string) => void> = [];
   private onDataChannelOpenCallbacks: Array<() => void> = [];
   private onDataChannelCloseCallbacks: Array<() => void> = [];
+
+  // File chunk callbacks — payload: { fileId, chunkIndex, isLast, data, name?, size?, mimeType? }
+  // data is ArrayBuffer for chunks, undefined for file-meta messages
+  // For file-meta messages, name/size/mimeType contain the file metadata
+  private onFileChunkCallbacks: Array<(data: { fileId: string; chunkIndex: number; isLast: boolean; data: ArrayBuffer | undefined; name?: string; size?: number; mimeType?: string }) => void> = [];
 
   // Promise for waiting for both channels to open (used by waitForChannelsOpen)
   private waitForChannelsPromise: Promise<void> | null = null;
@@ -119,7 +125,15 @@ export class PeerManager {
   }
 
   /**
-   * Check if both DataChannels are open.
+   * Get files DataChannel readyState.
+   */
+  getFilesChannelState(): RTCDataChannelState | null {
+    return this.filesChannel?.readyState ?? null;
+  }
+
+  /**
+   * Check if chat and yjs DataChannels are open.
+   * Note: files channel is optional and not checked here.
    */
   areDataChannelsOpen(): boolean {
     const chatOpen = this.chatChannel?.readyState === "open";
@@ -281,12 +295,19 @@ export class PeerManager {
     console.log(`[PeerManager] ✓ Initiator "chat" DataChannel created: label="${this.chatChannel.label}", id=${this.chatChannel.id}, readyState=${this.chatChannel.readyState}`);
     this.setupChatChannelListeners();
 
-    // Create "yjs" DataChannel — for Yjs CRDT updates
-    this.yjsChannel = this.peerConnection!.createDataChannel("yjs", {
-      ordered: true,
-    });
-    console.log(`[PeerManager] ✓ Initiator "yjs" DataChannel created: label="${this.yjsChannel.label}", id=${this.yjsChannel.id}, readyState=${this.yjsChannel.readyState}`);
-    this.setupYjsChannelListeners();
+     // Create "yjs" DataChannel — for Yjs CRDT updates
+     this.yjsChannel = this.peerConnection!.createDataChannel("yjs", {
+       ordered: true,
+     });
+     console.log(`[PeerManager] ✓ Initiator "yjs" DataChannel created: label="${this.yjsChannel.label}", id=${this.yjsChannel.id}, readyState=${this.yjsChannel.readyState}`);
+     this.setupYjsChannelListeners();
+
+     // Create "files" DataChannel — for binary file transfer
+     this.filesChannel = this.peerConnection!.createDataChannel("files", {
+       ordered: true,
+     });
+     console.log(`[PeerManager] ✓ Initiator "files" DataChannel created: label="${this.filesChannel.label}", id=${this.filesChannel.id}, readyState=${this.filesChannel.readyState}`);
+     this.setupFilesChannelListeners();
 
     // Create and set local offer
     console.log("[PeerManager] Creating WebRTC offer...");
@@ -351,6 +372,32 @@ export class PeerManager {
 
     this.yjsChannel.onerror = (event: Event) => {
       console.error(`[PeerManager] ✗ Initiator "yjs" DataChannel ERROR:`, event);
+    };
+  }
+
+  // ==================== Files DataChannel Listeners ====================
+
+  private setupFilesChannelListeners(): void {
+    if (!this.filesChannel) return;
+
+    console.log(`[PeerManager] Setting up listeners for Initiator "files" channel: ${this.filesChannel.readyState}`);
+
+    this.filesChannel.onopen = () => {
+      console.log(`[PeerManager] ✓ Initiator "files" DataChannel OPENED, readyState=${this.filesChannel!.readyState}`);
+      for (const cb of this.onDataChannelOpenCallbacks) cb();
+    };
+
+    this.filesChannel.onmessage = (event: MessageEvent) => {
+      this.handleFilesChannelMessage(event);
+    };
+
+    this.filesChannel.onclose = () => {
+      console.log(`[PeerManager] ✓ Initiator "files" DataChannel CLOSED`);
+      for (const cb of this.onDataChannelCloseCallbacks) cb();
+    };
+
+    this.filesChannel.onerror = (event: Event) => {
+      console.error(`[PeerManager] ✗ Initiator "files" DataChannel ERROR:`, event);
     };
   }
 
@@ -423,8 +470,8 @@ export class PeerManager {
     // CRITICAL: Set ALL handlers BEFORE setRemoteDescription
     // =========================================
 
-    // 1. Set ondatachannel handler FIRST — routes to chat or yjs channel
-    console.log("[PeerManager] ★ Setting ondatachannel handler (BEFORE setRemoteDescription)");
+    // 1. Set ondatachannel handler FIRST — routes to chat, yjs, or files channel
+    console.log("[PeerManager] ★ Setting up ondatachannel handler (BEFORE setRemoteDescription)");
     this.peerConnection.ondatachannel = (event: RTCDataChannelEvent) => {
       const label = event.channel.label;
       console.log(`[PeerManager] ★ ondatachannel EVENT FIRED: label="${label}", id=${event.channel.id}, readyState=${event.channel.readyState}`);
@@ -437,6 +484,10 @@ export class PeerManager {
         this.yjsChannel = event.channel;
         console.log(`[PeerManager] ★ Routing to "yjs" channel`);
         this.setupReceiverYjsChannelListeners();
+      } else if (label === "files") {
+        this.filesChannel = event.channel;
+        console.log(`[PeerManager] ★ Routing to "files" channel`);
+        this.setupReceiverFilesChannelListeners();
       } else {
         console.warn(`[PeerManager] ★ Unknown DataChannel label: ${label}`);
       }
@@ -545,6 +596,98 @@ export class PeerManager {
     };
   }
 
+  private setupReceiverFilesChannelListeners(): void {
+    if (!this.filesChannel) return;
+
+    console.log(`[PeerManager] Setting up Receiver "files" channel listeners: ${this.filesChannel.readyState}`);
+
+    this.filesChannel.onopen = () => {
+      console.log(`[PeerManager] ✓ Receiver "files" DataChannel OPENED, readyState=${this.filesChannel!.readyState}`);
+      for (const cb of this.onDataChannelOpenCallbacks) cb();
+    };
+
+    this.filesChannel.onmessage = (event: MessageEvent) => {
+      this.handleFilesChannelMessage(event);
+    };
+
+    this.filesChannel.onclose = () => {
+      console.log(`[PeerManager] ✓ Receiver "files" DataChannel CLOSED`);
+      for (const cb of this.onDataChannelCloseCallbacks) cb();
+    };
+
+    this.filesChannel.onerror = (event: Event) => {
+      console.error(`[PeerManager] ✗ Receiver "files" DataChannel ERROR:`, event);
+    };
+  }
+
+  // ==================== Files Channel Message Handler ====================
+
+  /**
+   * Handle incoming messages on the "files" DataChannel.
+   * Routes to file-meta or file-chunk callbacks.
+   */
+  private handleFilesChannelMessage(event: MessageEvent): void {
+    interface FileMetaMessage {
+      type: string;
+      fileId: string;
+      name?: string;
+      size?: number;
+      mimeType?: string;
+      chunkIndex?: number;
+      isLast?: boolean;
+      data?: string;
+    }
+
+    let parsed: FileMetaMessage;
+    try {
+      parsed = JSON.parse(event.data as string);
+    } catch {
+      console.error("[PeerManager] Failed to parse files channel message:", event.data);
+      return;
+    }
+
+    if (parsed.type === "file-meta") {
+      // Fire callback with metadata to signal file is coming
+      console.log(`[PeerManager] Routing file-meta: fileId=${parsed.fileId}, name=${parsed.name}, mimeType=${parsed.mimeType}`);
+      for (const cb of this.onFileChunkCallbacks) {
+        cb({ 
+          fileId: parsed.fileId, 
+          chunkIndex: 0, 
+          isLast: false, 
+          data: undefined,
+          name: parsed.name ?? "",
+          size: parsed.size ?? 0,
+          mimeType: parsed.mimeType ?? "",
+        });
+      }
+    } else if (parsed.type === "file-chunk") {
+      // Convert base64 data to ArrayBuffer
+      const base64 = parsed.data;
+      if (!base64) {
+        console.error("[PeerManager] File chunk missing data field");
+        return;
+      }
+
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      const arrayBuffer = bytes.buffer as ArrayBuffer;
+
+      for (const cb of this.onFileChunkCallbacks) {
+        cb({
+          fileId: parsed.fileId,
+          chunkIndex: parsed.chunkIndex ?? 0,
+          isLast: parsed.isLast ?? false,
+          data: arrayBuffer,
+        });
+      }
+    } else {
+      console.warn(`[PeerManager] Unknown files channel message type: ${parsed.type}`);
+    }
+  }
+
   // ==================== Answer & ICE Handling ====================
 
   /**
@@ -650,6 +793,75 @@ export class PeerManager {
     return false;
   }
 
+  // ==================== Public API: File Transfer ====================
+
+  /**
+   * Register a callback for incoming file chunks.
+   * Called internally when the "files" DataChannel receives a message.
+   *
+   * The callback payload:
+   *   - For file-chunk messages: data = ArrayBuffer (chunk binary)
+   *   - For file-meta messages:  data = undefined
+   */
+  onFileChunk(callback: (data: { fileId: string; chunkIndex: number; isLast: boolean; data: ArrayBuffer | undefined }) => void): void {
+    this.onFileChunkCallbacks.push(callback);
+  }
+
+  /**
+   * Send file metadata to all connected peers.
+   * Announces an upcoming file transfer before sending chunks.
+   */
+  sendFileMeta(fileId: string, name: string, size: number, mimeType: string): boolean {
+    if (!this.filesChannel) {
+      console.error("[PeerManager] ✗ Cannot send file meta — files channel is undefined/null");
+      return false;
+    }
+
+    if (this.filesChannel.readyState !== "open") {
+      console.warn(`[PeerManager] ⚠ Cannot send — "files" channel is not open (state: ${this.filesChannel.readyState})`);
+      return false;
+    }
+
+    const msg = JSON.stringify({
+      type: "file-meta",
+      fileId,
+      name,
+      size,
+      mimeType,
+    });
+    this.filesChannel.send(msg);
+    console.log(`[PeerManager] → Sent file-meta: fileId=${fileId}, name=${name}, size=${size}, mimeType=${mimeType}`);
+    return true;
+  }
+
+  /**
+   * Send a file chunk via the "files" DataChannel.
+   */
+  sendFileChunk(fileId: string, chunkIndex: number, data: ArrayBuffer, isLast: boolean): boolean {
+    if (!this.filesChannel) {
+      console.error("[PeerManager] ✗ Cannot send file chunk — files channel is undefined/null");
+      return false;
+    }
+
+    if (this.filesChannel.readyState !== "open") {
+      console.warn(`[PeerManager] ⚠ Cannot send — "files" channel is not open (state: ${this.filesChannel.readyState})`);
+      return false;
+    }
+
+    const bytes = new Uint8Array(data);
+    const base64 = btoa(String.fromCharCode(...bytes));
+    const msg = JSON.stringify({
+      type: "file-chunk",
+      fileId,
+      chunkIndex,
+      isLast,
+      data: base64,
+    });
+    this.filesChannel.send(msg);
+    console.log(`[PeerManager] → Sent file chunk: fileId=${fileId}, chunk=${chunkIndex}, isLast=${isLast}`);
+    return true;
+  }
+
   // ==================== Public API: Status ====================
 
   /**
@@ -681,6 +893,9 @@ export class PeerManager {
     this.yjsChannel?.close();
     this.yjsChannel = null;
 
+    this.filesChannel?.close();
+    this.filesChannel = null;
+
     this.peerConnection?.close();
     this.peerConnection = null;
 
@@ -689,5 +904,6 @@ export class PeerManager {
     this.onConnectionStateChangeCallbacks = [];
     this.onDataChannelOpenCallbacks = [];
     this.onDataChannelCloseCallbacks = [];
+    this.onFileChunkCallbacks = [];
   }
 }

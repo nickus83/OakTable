@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import { SignalingClient } from "./webrtc/signaling";
 import { PeerManager } from "./webrtc/peerManager";
+import { FileTransferManager } from "./webrtc/fileTransfer";
 import { YjsManager } from "./sync/yjsManager";
 import type { TableObjectData } from "./sync/yjsManager";
 import TableCanvas, { TableCanvasRef } from "./table/TableCanvas";
@@ -36,9 +37,11 @@ export default function App() {
   const signalingRef = useRef<SignalingClient | null>(null);
   const peerRef = useRef<PeerManager | null>(null);
   const yjsRef = useRef<YjsManager | null>(null);
+  const fileTransferRef = useRef<FileTransferManager | null>(null);
   const checkDcIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const yjsConnectedRef = useRef(false);
   const tableCanvasRef = useRef<TableCanvasRef | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // ─── Cleanup on unmount ───
   useEffect(() => {
@@ -107,6 +110,59 @@ export default function App() {
     // PeerManager
     const peerManager = new PeerManager(signaling);
     peerRef.current = peerManager;
+
+    // FileTransferManager — creates after connection to wire up callbacks
+    const fileTransfer = new FileTransferManager(peerManager);
+    fileTransferRef.current = fileTransfer;
+
+    // Wire up file received callback — when a file blob is received P2P,
+    // load it into TableCanvas's texture cache and update the corresponding object.
+    fileTransfer.onFileComplete((fileId: string, blob: Blob, meta) => {
+      console.log(`[App] File received: ${meta.name} (${blob.size} bytes), mimeType: ${blob.type}, fileId: ${fileId}`);
+
+      const yjs = yjsRef.current;
+      if (!yjs) {
+        console.warn("[App] Yjs not available, cannot create object for received file");
+        return;
+      }
+
+      // Find the Yjs object that has this fileId.
+      // The sender creates the Yjs object synchronously, so it should already exist.
+      const existingObjects = yjs.getAllObjects();
+      let targetObjId: string | null = null;
+      for (const [id, objData] of existingObjects) {
+        if (objData.fileId === fileId) {
+          targetObjId = id;
+          break;
+        }
+      }
+
+      if (!targetObjId) {
+        console.warn(`[App] No Yjs object found for received file: ${fileId}. The sender's object may not have synced yet.`);
+        // Retry after a short delay in case the object was just created.
+        setTimeout(() => {
+          const retryObjects = yjs.getAllObjects();
+          for (const [id, objData] of retryObjects) {
+            if (objData.fileId === fileId) {
+              targetObjId = id;
+              break;
+            }
+          }
+          if (!targetObjId) {
+            console.error(`[App] Still no Yjs object for fileId ${fileId} after retry`);
+            return;
+          }
+          // Load blob into TableCanvas texture cache.
+          tableCanvasRef.current?.loadFileBlob(fileId, blob);
+          console.log(`[App] ✅ Loaded file ${meta.name} into TableCanvas (Yjs object: ${targetObjId}), blob.type: ${blob.type}`);
+        }, 500);
+        return;
+      }
+
+      // Load blob into TableCanvas texture cache.
+      tableCanvasRef.current?.loadFileBlob(fileId, blob);
+      console.log(`[App] ✅ Loaded file ${meta.name} into TableCanvas (Yjs object: ${targetObjId}), blob.type: ${blob.type}`);
+    });
 
     peerManager.onConnectionStateChange((state: string) => {
       setConnectionStatus(state);
@@ -203,24 +259,6 @@ export default function App() {
   };
 
   // ─── Table actions — ALL objects go through Yjs only ───
-  const handleAddImage = (): void => {
-    const yjs = yjsRef.current;
-    if (!yjs) {
-      console.warn("[App] Yjs not initialized, cannot add image");
-      return;
-    }
-    const id = crypto.randomUUID();
-    console.log(`[App] Adding image to Yjs: id=${id}, x=100, y=100`);
-    yjs.addObject({
-      x: 100,
-      y: 100,
-      rotation: 0,
-      scale: 1,
-      type: "image",
-      name: id,
-    });
-  };
-
   const handleAddNote = (): void => {
     const yjs = yjsRef.current;
     if (!yjs) {
@@ -239,11 +277,73 @@ export default function App() {
     });
   };
 
+  // ─── File upload: send via P2P + create Yjs object ───
+  const handleFileSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>): void => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // Check connection state first
+    if (!peerRef.current?.areDataChannelsOpen()) {
+      alert("Please connect via WebRTC first before uploading images.");
+      e.target.value = "";
+      return;
+    }
+
+    const fileTransfer = fileTransferRef.current;
+    if (!fileTransfer) {
+      console.error("[App] FileTransferManager not initialized");
+      alert("File transfer system not available. Please reconnect.");
+      e.target.value = "";
+      return;
+    }
+
+    if (!file.type.startsWith("image/")) {
+      alert("Please select an image file");
+      return;
+    }
+
+    console.log(`[App] User selected image: ${file.name} (${file.size} bytes), type: ${file.type}`);
+
+    // Send file via P2P — FileTransferManager generates fileId and splits into chunks
+    const fileId = fileTransfer.sendFile(file);
+    console.log(`[App] File send initiated, fileId: ${fileId}`);
+
+    // CRITICAL: Immediately get the local blob and load it into TableCanvas.
+    // This ensures the GM (sender) sees the image immediately on their own screen.
+    const localBlob = fileTransfer.getLocalFile(fileId);
+    if (localBlob) {
+      tableCanvasRef.current?.loadFileBlob(fileId, localBlob);
+      console.log(`[App] Stored local file blob for fileId: ${fileId}, size=${localBlob.size}`);
+    } else {
+      console.warn(`[App] No local blob found for fileId: ${fileId}`);
+    }
+
+    // Create Yjs object with the same fileId so the receiver can match it.
+    const yjs = yjsRef.current;
+    if (yjs) {
+      const objectId = crypto.randomUUID();
+      yjs.addObject({
+        id: objectId,
+        x: 100,
+        y: 100,
+        rotation: 0,
+        scale: 1,
+        type: "image",
+        name: file.name,
+        fileId: fileId,
+      });
+      console.log(`[App] Yjs object created: objectId=${objectId}, fileId=${fileId}`);
+    }
+
+    e.target.value = "";
+  }, []);
   // ─── Disconnect ───
   const handleDisconnect = (): void => {
     if (checkDcIntervalRef.current) {
       clearInterval(checkDcIntervalRef.current);
     }
+    fileTransferRef.current?.destroy();
+    fileTransferRef.current = null;
     yjsRef.current?.close();
     peerRef.current?.close();
     signalingRef.current?.disconnect();
@@ -270,12 +370,20 @@ export default function App() {
 
         {/* Toolbar overlay */}
         <div style={styles.toolbar}>
-          <button style={styles.toolbarBtn} onClick={handleAddImage}>
-            🖼 Add Image
+          <button style={styles.toolbarBtn} onClick={() => fileInputRef.current?.click()}>
+            🖼️ Upload Image
           </button>
           <button style={styles.toolbarBtn} onClick={handleAddNote}>
             📝 Add Note
           </button>
+          {/* Hidden file input */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            style={{ display: "none" }}
+            onChange={handleFileSelect}
+          />
           <span style={styles.toolbarHint}>
             Drag to pan · Scroll to zoom
           </span>

@@ -12,6 +12,7 @@ export interface TableObjectOptions {
   height?: number;
   rotation?: number;
   scale?: number;
+  fileId?: string;
 }
 
 export type DragCallback = (id: string, x: number, y: number) => void;
@@ -45,6 +46,9 @@ export class TableObject {
   private containerStartX = 0;
   private containerStartY = 0;
 
+  // Store original options for fileId access
+  private _options: TableObjectOptions;
+
   constructor(options: TableObjectOptions, app: PIXI.Application) {
     this.id = options.id;
     this.type = options.type;
@@ -55,6 +59,7 @@ export class TableObject {
     this._scale = options.scale ?? 1;
     this.width = options.width ?? 200;
     this.height = options.height ?? 150;
+    this._options = options;
 
     this._container = new PIXI.Container();
     this._container.x = this._x;
@@ -330,6 +335,68 @@ export class TableObject {
     this._container.removeChildren();
     this.createNote();
     this.addBorder();
+  }
+
+  /**
+   * Replace the current sprite/graphics with a new texture.
+   * Used when a file is received P2P and we need to update the placeholder.
+   * The old sprite/graphics is destroyed before adding the new one.
+   * The sprite is positioned to match the placeholder's coordinate system (top-left anchored).
+   */
+  updateTexture(texture: PIXI.Texture): void {
+    console.log(`[TableObject] updateTexture called for id=${this.id}, texWidth=${texture.width}, texHeight=${texture.height}`);
+    
+    // Destroy old sprite or graphics (not the container)
+    const children = this._container.children;
+    for (const child of children) {
+      if (child instanceof PIXI.Sprite || child instanceof PIXI.Graphics) {
+        child.destroy({ children: false });
+      }
+    }
+
+    // Remove all old children
+    this._container.removeChildren();
+
+    // Create new sprite with the provided texture
+    this._sprite = new PIXI.Sprite(texture);
+    
+    // Calculate display size based on texture aspect ratio
+    // Use the same logic as createImageSprite to maintain consistency
+    const aspect = texture.width / texture.height;
+    if (aspect > 1) {
+      this._sprite.width = this.width;
+      this._sprite.height = this.width / aspect;
+    } else {
+      this._sprite.height = this.height;
+      this._sprite.width = this.height * aspect;
+    }
+    
+    // Anchor center to match how placeholders are positioned
+    this._sprite.anchor.set(0.5);
+    // Position sprite so its center matches the container's expected position
+    this._sprite.x = this.width / 2;
+    this._sprite.y = this.height / 2;
+    
+    this._container.addChild(this._sprite);
+
+    // Re-add border — recreate border with proper size
+    this.addBorder();
+    
+    console.log(`[TableObject] ✓ Texture applied: id=${this.id}, spriteWidth=${this._sprite.width}, spriteHeight=${this._sprite.height}`);
+  }
+
+  /**
+   * Get the fileId associated with this object (for texture matching).
+   */
+  get fileId(): string | undefined {
+    return this._options?.fileId;
+  }
+
+  /**
+   * Check if this object is waiting for a file (has fileId but no valid image content).
+   */
+  isWaitingForFile(): boolean {
+    return this.type === "image" && !!this._options?.fileId && !this.content;
   }
 
   /**
